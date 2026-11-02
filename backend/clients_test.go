@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -168,16 +169,28 @@ func TestSABnzbd(t *testing.T) {
 
 // fakeJD is a JDownloader local API with a link grabber.
 type fakeJD struct {
-	t        *testing.T
-	added    []map[string]any
-	crawling int // queryLinkCrawlerJobs calls that still report crawling
-	moved    []int64
-	removed  []int64
-	removedP []int64
+	t          *testing.T
+	mu         sync.Mutex
+	added      []map[string]any
+	collecting int  // isCollecting calls that still answer true
+	empty      bool // the link grabber starts empty; addLinks fills it
+	moved      []int64
+	removed    []int64
+	removedP   []int64
 }
+
+const fakeGrabber = `[
+	{"uuid": 11, "packageUUID": 10, "name": "a.jpg", "bytesTotal": 100, "availability": "ONLINE"},
+	{"uuid": 12, "packageUUID": 10, "name": "b.png", "bytesTotal": 100, "availability": "ONLINE"},
+	{"uuid": 21, "packageUUID": 20, "name": "movie.mp4", "bytesTotal": 9000, "availability": "ONLINE"},
+	{"uuid": 22, "packageUUID": 20, "name": "thumb.jpg", "bytesTotal": 10, "availability": "ONLINE"},
+	{"uuid": 23, "packageUUID": 20, "name": "page.html", "bytesTotal": 5, "availability": "ONLINE"},
+	{"uuid": 24, "packageUUID": 20, "name": "gone.mkv", "availability": "OFFLINE"}]`
 
 func (f *fakeJD) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		var params []json.RawMessage
 		for _, p := range strings.Split(r.URL.RawQuery, "&") {
 			if p == "" {
@@ -196,6 +209,7 @@ func (f *fakeJD) handler() http.Handler {
 			var q map[string]any
 			arg(0, &q)
 			f.added = append(f.added, q)
+			f.empty = false
 			io.WriteString(w, `{"data": {"id": 77}}`)
 		case "/linkgrabberv2/addContainer":
 			var typ, data string
@@ -205,22 +219,17 @@ func (f *fakeJD) handler() http.Handler {
 				f.t.Errorf("container %q", params)
 			}
 			io.WriteString(w, `{"data": {"id": 78}}`)
-		case "/linkgrabberv2/queryLinkCrawlerJobs":
-			busy := f.crawling > 0
-			f.crawling--
-			fmt.Fprintf(w, `{"data": [{"jobId": 77, "crawling": %v, "checking": false}]}`, busy)
 		case "/linkgrabberv2/isCollecting":
-			io.WriteString(w, `{"data": false}`)
+			fmt.Fprintf(w, `{"data": %v}`, f.collecting > 0)
+			f.collecting--
 		case "/linkgrabberv2/queryPackages":
 			io.WriteString(w, `{"data": [{"uuid": 10, "name": "Album"}, {"uuid": 20, "name": "Video page"}]}`)
 		case "/linkgrabberv2/queryLinks":
-			io.WriteString(w, `{"data": [
-				{"uuid": 11, "packageUUID": 10, "name": "a.jpg", "bytesTotal": 100, "availability": "ONLINE"},
-				{"uuid": 12, "packageUUID": 10, "name": "b.png", "bytesTotal": 100, "availability": "ONLINE"},
-				{"uuid": 21, "packageUUID": 20, "name": "movie.mp4", "bytesTotal": 9000, "availability": "ONLINE"},
-				{"uuid": 22, "packageUUID": 20, "name": "thumb.jpg", "bytesTotal": 10, "availability": "ONLINE"},
-				{"uuid": 23, "packageUUID": 20, "name": "page.html", "bytesTotal": 5, "availability": "ONLINE"},
-				{"uuid": 24, "packageUUID": 20, "name": "gone.mkv", "availability": "OFFLINE"}]}`)
+			if f.empty {
+				io.WriteString(w, `{"data": []}`)
+			} else {
+				io.WriteString(w, `{"data": `+fakeGrabber+`}`)
+			}
 		case "/linkgrabberv2/moveToDownloadlist":
 			var l, p []int64
 			arg(0, &l)
@@ -289,18 +298,23 @@ func TestJDownloader(t *testing.T) {
 }
 
 func TestJDownloaderAutoStart(t *testing.T) {
-	f := &fakeJD{t: t, crawling: 2}
+	f := &fakeJD{t: t, collecting: 2, empty: true}
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
 	j := NewJDownloader(srv.URL)
 	j.pollEvery = 10 * time.Millisecond
-	j.autoJobs[77] = true
-	j.autoStart(77) // what Add starts in the background for Review: false
-	if fmt.Sprint(f.moved) != "[11 12 21]" || fmt.Sprint(f.removed) != "[22 23 24]" {
-		t.Fatalf("moved %v removed %v", f.moved, f.removed)
+	if err := j.Add(context.Background(), Item{Kind: KindLink, URL: "https://bunkr.example/v/x"}, ""); err != nil {
+		t.Fatal(err)
 	}
-	if len(j.autoJobs) != 0 {
-		t.Fatal("job still tracked")
+	j.autoMu.Lock() // held by the automatic start until it is done
+	defer j.autoMu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.added[0]["autostart"] != false || fmt.Sprint(f.moved) != "[11 12 21]" || fmt.Sprint(f.removed) != "[22 23 24]" {
+		t.Fatalf("added %v moved %v removed %v", f.added, f.moved, f.removed)
+	}
+	if len(j.pending) != 0 {
+		t.Fatal("snapshot still pending")
 	}
 }
 

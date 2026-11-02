@@ -36,13 +36,22 @@ type JDownloader struct {
 	// pollEvery is how often it checks.
 	crawlTimeout, pollEvery time.Duration
 
-	mu       sync.Mutex
-	autoJobs map[int64]bool // crawl jobs drop starts by itself
+	// Automatic starts run one at a time (autoMu): the API doesn't tell
+	// which crawled links belong to which addLinks call (no job ids on the
+	// links, no crawler jobs listed), so each one takes the links that are
+	// new compared to a snapshot taken before its add. pending holds the
+	// snapshots of starts still waiting, for the review list.
+	autoMu  sync.Mutex
+	mu      sync.Mutex
+	pending []*snapshot
 }
+
+// snapshot is the link grabber's link ids before an automatic start's add.
+type snapshot struct{ ids map[string]bool }
 
 func NewJDownloader(baseURL string) *JDownloader {
 	return &JDownloader{url: strings.TrimRight(baseURL, "/"), http: &http.Client{Timeout: httpTimeout},
-		crawlTimeout: 10 * time.Minute, pollEvery: 2 * time.Second, autoJobs: map[int64]bool{}}
+		crawlTimeout: 10 * time.Minute, pollEvery: 2 * time.Second}
 }
 
 // call invokes namespace/method with positional params and decodes the
@@ -101,29 +110,55 @@ func firstLine(b []byte) string {
 }
 
 func (j *JDownloader) Add(ctx context.Context, it Item, _ string) error {
-	var job struct {
-		ID int64 `json:"id"`
+	if !it.Review {
+		// Hold the lock from the snapshot to the end of the crawl, so two
+		// automatic starts don't take each other's links.
+		j.autoMu.Lock()
+		before, err := j.linkIDs(ctx)
+		if err != nil {
+			j.autoMu.Unlock()
+			return err
+		}
+		if err := j.add(ctx, it); err != nil {
+			j.autoMu.Unlock()
+			return err
+		}
+		snap := &snapshot{before}
+		j.mu.Lock()
+		j.pending = append(j.pending, snap)
+		j.mu.Unlock()
+		go func() {
+			defer j.autoMu.Unlock()
+			j.autoStart(snap)
+		}()
+		return nil
 	}
+	return j.add(ctx, it)
+}
+
+// add puts an item into the link grabber, without autostart.
+func (j *JDownloader) add(ctx context.Context, it Item) error {
 	switch it.Kind {
 	case KindLink, KindTorrentURL, KindNZBURL:
-		if err := j.call(ctx, "linkgrabberv2/addLinks", &job, map[string]any{"links": it.URL, "autostart": false}); err != nil {
-			return err
-		}
+		return j.call(ctx, "linkgrabberv2/addLinks", nil, map[string]any{"links": it.URL, "autostart": false})
 	case KindDLCFile:
 		data := "data:application/octet-stream;base64," + base64.StdEncoding.EncodeToString(it.Data)
-		if err := j.call(ctx, "linkgrabberv2/addContainer", &job, "DLC", data); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("JDownloader can't take a %s", it.Kind)
+		return j.call(ctx, "linkgrabberv2/addContainer", nil, "DLC", data)
 	}
-	if !it.Review && job.ID != 0 {
-		j.mu.Lock()
-		j.autoJobs[job.ID] = true
-		j.mu.Unlock()
-		go j.autoStart(job.ID)
+	return fmt.Errorf("JDownloader can't take a %s", it.Kind)
+}
+
+// linkIDs is the set of links currently in the link grabber.
+func (j *JDownloader) linkIDs(ctx context.Context) (map[string]bool, error) {
+	links, err := j.links(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	ids := map[string]bool{}
+	for _, l := range links {
+		ids[l.UUID.String()] = true
+	}
+	return ids, nil
 }
 
 // JDownloader has no categories: everything goes to its download folder.
@@ -220,11 +255,11 @@ func (j *JDownloader) Review(ctx context.Context) ([]ReviewPackage, bool, error)
 	if err := j.call(ctx, "linkgrabberv2/queryPackages", &pkgs, map[string]any{"maxResults": -1, "startAt": 0}); err != nil {
 		return nil, false, err
 	}
-	links, err := j.links(ctx, nil)
+	links, err := j.links(ctx)
 	if err != nil {
 		return nil, false, err
 	}
-	auto := j.autoPackages(ctx)
+	auto := j.autoPackages(links)
 	out := make([]ReviewPackage, 0, len(pkgs))
 	for _, p := range pkgs {
 		rp := ReviewPackage{ID: p.UUID.String(), Name: p.Name, Auto: auto[p.UUID.String()], Links: []ReviewLink{}}
@@ -252,36 +287,27 @@ type jdLink struct {
 	URL          string      `json:"url"`
 }
 
-// links lists the link grabber's links, of the given crawl jobs or all.
-func (j *JDownloader) links(ctx context.Context, jobs []int64) ([]jdLink, error) {
+// links lists the link grabber's links.
+func (j *JDownloader) links(ctx context.Context) ([]jdLink, error) {
 	q := map[string]any{"bytesTotal": true, "availability": true, "url": true, "maxResults": -1, "startAt": 0}
-	if jobs != nil {
-		q["jobUUIDs"] = jobs
-	}
 	var links []jdLink
 	err := j.call(ctx, "linkgrabberv2/queryLinks", &links, q)
 	return links, err
 }
 
-// autoPackages are the link grabber packages of crawl jobs drop starts by
-// itself (so the review list can show them as such).
-func (j *JDownloader) autoPackages(ctx context.Context) map[string]bool {
+// autoPackages are the packages with links that are new compared to a
+// waiting automatic start's snapshot (so the review list can show them as
+// starting by themselves).
+func (j *JDownloader) autoPackages(links []jdLink) map[string]bool {
 	j.mu.Lock()
-	var jobs []int64
-	for id := range j.autoJobs {
-		jobs = append(jobs, id)
-	}
-	j.mu.Unlock()
+	defer j.mu.Unlock()
 	out := map[string]bool{}
-	if len(jobs) == 0 {
-		return out
-	}
-	links, err := j.links(ctx, jobs)
-	if err != nil {
-		return out
-	}
-	for _, l := range links {
-		out[l.PackageUUID.String()] = true
+	for _, snap := range j.pending {
+		for _, l := range links {
+			if !snap.ids[l.UUID.String()] {
+				out[l.PackageUUID.String()] = true
+			}
+		}
 	}
 	return out
 }
@@ -305,64 +331,77 @@ func (j *JDownloader) Discard(ctx context.Context, packages []int64) error {
 	return j.call(ctx, "linkgrabberv2/removeLinks", nil, []int64{}, packages)
 }
 
-// autoStart waits until crawl job id is done, then starts the relevant
-// links of its packages and removes the rest.
-func (j *JDownloader) autoStart(id int64) {
+// autoStart waits until JDownloader has finished collecting the links
+// added after the snapshot (not collecting, and the link list unchanged
+// between two checks), then starts the relevant new links per package and
+// removes the other new ones.
+func (j *JDownloader) autoStart(snap *snapshot) {
+	before := snap.ids
 	defer func() {
 		j.mu.Lock()
-		delete(j.autoJobs, id)
+		for i, p := range j.pending {
+			if p == snap {
+				j.pending = append(j.pending[:i], j.pending[i+1:]...)
+				break
+			}
+		}
 		j.mu.Unlock()
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), j.crawlTimeout)
 	defer cancel()
+
+	var links []jdLink
+	last := -1
 	for {
-		var jobs []struct {
-			JobID    json.Number `json:"jobId"`
-			Crawling bool        `json:"crawling"`
-			Checking bool        `json:"checking"`
-		}
-		err := j.call(ctx, "linkgrabberv2/queryLinkCrawlerJobs", &jobs, map[string]any{"jobIds": []int64{id}, "collectorInfo": true})
-		if err != nil {
-			log.Printf("jdownloader auto start %d: %v", id, err)
-			return
-		}
-		busy := false
-		for _, jb := range jobs {
-			busy = busy || jb.Crawling || jb.Checking
-		}
-		if !busy {
-			break
-		}
 		select {
 		case <-ctx.Done():
-			log.Printf("jdownloader auto start %d: crawl not done after %s, left in the link grabber", id, j.crawlTimeout)
+			log.Printf("jdownloader auto start: links not settled after %s, left in the link grabber", j.crawlTimeout)
 			return
 		case <-time.After(j.pollEvery):
 		}
+		var collecting bool
+		if err := j.call(ctx, "linkgrabberv2/isCollecting", &collecting); err != nil {
+			log.Printf("jdownloader auto start: %v", err)
+			return
+		}
+		var err error
+		if links, err = j.links(ctx); err != nil {
+			log.Printf("jdownloader auto start: %v", err)
+			return
+		}
+		checking := false
+		for _, l := range links {
+			if !before[l.UUID.String()] && (l.Availability == "" || l.Availability == "UNKNOWN") {
+				checking = true // not checked yet: no name/size to judge
+			}
+		}
+		if !collecting && !checking && len(links) == last {
+			break
+		}
+		last = len(links)
 	}
-	links, err := j.links(ctx, []int64{id})
-	if err != nil {
-		log.Printf("jdownloader auto start %d: %v", id, err)
-		return
-	}
-	byPkg := map[string][]int{}
+
+	byPkg := map[string][]jdLink{}
 	var order []string
-	for i, l := range links {
+	for _, l := range links {
+		if before[l.UUID.String()] {
+			continue
+		}
 		p := l.PackageUUID.String()
 		if _, ok := byPkg[p]; !ok {
 			order = append(order, p)
 		}
-		byPkg[p] = append(byPkg[p], i)
+		byPkg[p] = append(byPkg[p], l)
 	}
 	var start, remove []int64
 	for _, p := range order {
 		var rl []ReviewLink
-		for _, i := range byPkg[p] {
-			rl = append(rl, ReviewLink{Name: links[i].Name, Size: links[i].BytesTotal, Availability: links[i].Availability})
+		for _, l := range byPkg[p] {
+			rl = append(rl, ReviewLink{Name: l.Name, Size: l.BytesTotal, Availability: l.Availability})
 		}
 		pick := pickRelevant(rl)
-		for k, i := range byPkg[p] {
-			n, _ := links[i].UUID.Int64()
+		for k, l := range byPkg[p] {
+			n, _ := l.UUID.Int64()
 			if pick[k] {
 				start = append(start, n)
 			} else {
@@ -371,10 +410,10 @@ func (j *JDownloader) autoStart(id int64) {
 		}
 	}
 	if err := j.Start(ctx, start, remove); err != nil {
-		log.Printf("jdownloader auto start %d: %v", id, err)
+		log.Printf("jdownloader auto start: %v", err)
 		return
 	}
-	log.Printf("jdownloader auto start %d: started %d, removed %d", id, len(start), len(remove))
+	log.Printf("jdownloader auto start: started %d, removed %d", len(start), len(remove))
 }
 
 // File types for pickRelevant.
