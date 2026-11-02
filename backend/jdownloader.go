@@ -33,8 +33,9 @@ type JDownloader struct {
 	http *http.Client
 
 	// crawlTimeout bounds how long an automatic start waits for a crawl;
-	// pollEvery is how often it checks.
-	crawlTimeout, pollEvery time.Duration
+	// pollEvery is how often it checks; settleTime is how long it waits for
+	// anything new to appear at all.
+	crawlTimeout, pollEvery, settleTime time.Duration
 
 	// Automatic starts run one at a time (autoMu): the API doesn't tell
 	// which crawled links belong to which addLinks call (no job ids on the
@@ -51,7 +52,7 @@ type snapshot struct{ ids map[string]bool }
 
 func NewJDownloader(baseURL string) *JDownloader {
 	return &JDownloader{url: strings.TrimRight(baseURL, "/"), http: &http.Client{Timeout: httpTimeout},
-		crawlTimeout: 10 * time.Minute, pollEvery: 2 * time.Second}
+		crawlTimeout: 10 * time.Minute, pollEvery: 2 * time.Second, settleTime: 15 * time.Second}
 }
 
 // call invokes namespace/method with positional params and decodes the
@@ -352,6 +353,7 @@ func (j *JDownloader) autoStart(snap *snapshot) {
 
 	var links []jdLink
 	last := -1
+	started := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -369,13 +371,20 @@ func (j *JDownloader) autoStart(snap *snapshot) {
 			log.Printf("jdownloader auto start: %v", err)
 			return
 		}
-		checking := false
+		checking, fresh := false, 0
 		for _, l := range links {
-			if !before[l.UUID.String()] && (l.Availability == "" || l.Availability == "UNKNOWN") {
-				checking = true // not checked yet: no name/size to judge
+			if !before[l.UUID.String()] {
+				fresh++
+				if l.Availability == "" || l.Availability == "UNKNOWN" {
+					checking = true // not checked yet: no name/size to judge
+				}
 			}
 		}
-		if !collecting && !checking && len(links) == last {
+		// Nothing new yet: the crawl may not have started. Give it
+		// settleTime before concluding JDownloader added nothing (a link it
+		// already has is not added again).
+		settled := fresh > 0 || time.Since(started) >= j.settleTime
+		if !collecting && !checking && len(links) == last && settled {
 			break
 		}
 		last = len(links)

@@ -303,6 +303,7 @@ func TestJDownloaderAutoStart(t *testing.T) {
 	defer srv.Close()
 	j := NewJDownloader(srv.URL)
 	j.pollEvery = 10 * time.Millisecond
+	j.settleTime = 50 * time.Millisecond
 	if err := j.Add(context.Background(), Item{Kind: KindLink, URL: "https://bunkr.example/v/x"}, ""); err != nil {
 		t.Fatal(err)
 	}
