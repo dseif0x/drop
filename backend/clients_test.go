@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDeluge(t *testing.T) {
@@ -164,63 +166,163 @@ func TestSABnzbd(t *testing.T) {
 	}
 }
 
-func TestJDownloader(t *testing.T) {
-	var added []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var params []any
+// fakeJD is a JDownloader local API with a link grabber.
+type fakeJD struct {
+	t        *testing.T
+	added    []map[string]any
+	crawling int // queryLinkCrawlerJobs calls that still report crawling
+	moved    []int64
+	removed  []int64
+	removedP []int64
+}
+
+func (f *fakeJD) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var params []json.RawMessage
 		for _, p := range strings.Split(r.URL.RawQuery, "&") {
 			if p == "" {
 				continue
 			}
 			s, _ := url.QueryUnescape(p)
-			var v any
-			if err := json.Unmarshal([]byte(s), &v); err != nil {
-				t.Errorf("param %q: %v", s, err)
+			params = append(params, json.RawMessage(s))
+		}
+		arg := func(i int, v any) {
+			if err := json.Unmarshal(params[i], v); err != nil {
+				f.t.Errorf("%s param %d %q: %v", r.URL.Path, i, params[i], err)
 			}
-			params = append(params, v)
 		}
 		switch r.URL.Path {
 		case "/linkgrabberv2/addLinks":
-			q := params[0].(map[string]any)
-			added = append(added, q["links"].(string))
-			if q["autostart"] != true {
-				t.Error("autostart")
-			}
-			io.WriteString(w, `{"data": {"id": 1}}`)
+			var q map[string]any
+			arg(0, &q)
+			f.added = append(f.added, q)
+			io.WriteString(w, `{"data": {"id": 77}}`)
 		case "/linkgrabberv2/addContainer":
-			if params[0] != "DLC" || !strings.HasPrefix(params[1].(string), "data:application/octet-stream;base64,") {
-				t.Errorf("container %v", params)
+			var typ, data string
+			arg(0, &typ)
+			arg(1, &data)
+			if typ != "DLC" || !strings.HasPrefix(data, "data:application/octet-stream;base64,") {
+				f.t.Errorf("container %q", params)
 			}
-			io.WriteString(w, `{"data": {"id": 2}}`)
+			io.WriteString(w, `{"data": {"id": 78}}`)
+		case "/linkgrabberv2/queryLinkCrawlerJobs":
+			busy := f.crawling > 0
+			f.crawling--
+			fmt.Fprintf(w, `{"data": [{"jobId": 77, "crawling": %v, "checking": false}]}`, busy)
+		case "/linkgrabberv2/isCollecting":
+			io.WriteString(w, `{"data": false}`)
+		case "/linkgrabberv2/queryPackages":
+			io.WriteString(w, `{"data": [{"uuid": 10, "name": "Album"}, {"uuid": 20, "name": "Video page"}]}`)
+		case "/linkgrabberv2/queryLinks":
+			io.WriteString(w, `{"data": [
+				{"uuid": 11, "packageUUID": 10, "name": "a.jpg", "bytesTotal": 100, "availability": "ONLINE"},
+				{"uuid": 12, "packageUUID": 10, "name": "b.png", "bytesTotal": 100, "availability": "ONLINE"},
+				{"uuid": 21, "packageUUID": 20, "name": "movie.mp4", "bytesTotal": 9000, "availability": "ONLINE"},
+				{"uuid": 22, "packageUUID": 20, "name": "thumb.jpg", "bytesTotal": 10, "availability": "ONLINE"},
+				{"uuid": 23, "packageUUID": 20, "name": "page.html", "bytesTotal": 5, "availability": "ONLINE"},
+				{"uuid": 24, "packageUUID": 20, "name": "gone.mkv", "availability": "OFFLINE"}]}`)
+		case "/linkgrabberv2/moveToDownloadlist":
+			var l, p []int64
+			arg(0, &l)
+			arg(1, &p)
+			f.moved = append(f.moved, l...)
+			io.WriteString(w, `{"data": null}`)
+		case "/linkgrabberv2/removeLinks":
+			var l, p []int64
+			arg(0, &l)
+			arg(1, &p)
+			f.removed = append(f.removed, l...)
+			f.removedP = append(f.removedP, p...)
+			io.WriteString(w, `{"data": null}`)
 		case "/downloadsV2/queryPackages":
 			io.WriteString(w, `{"data": [
 				{"uuid": 1, "name": "Run", "bytesLoaded": 30, "bytesTotal": 120, "speed": 7, "eta": 13, "running": true, "enabled": true},
 				{"uuid": 2, "name": "Fin", "bytesLoaded": 5, "bytesTotal": 5, "finished": true, "enabled": true},
 				{"uuid": 3, "name": "Off", "bytesTotal": 5, "enabled": false}]}`)
-		case "/linkgrabberv2/queryPackages":
-			io.WriteString(w, `[{"uuid": 9, "name": "Crawl", "bytesTotal": 0}]`)
 		default:
-			t.Errorf("path %s", r.URL.Path)
+			f.t.Errorf("path %s", r.URL.Path)
 		}
-	}))
+	})
+}
+
+func TestJDownloader(t *testing.T) {
+	f := &fakeJD{t: t}
+	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
 	ctx := context.Background()
 	j := NewJDownloader(srv.URL)
-	if err := j.Add(ctx, Item{Kind: KindLink, URL: "https://h.example/f?a=1&b=2"}, ""); err != nil {
+	if err := j.Add(ctx, Item{Kind: KindLink, URL: "https://h.example/f?a=1&b=2", Review: true}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Add(ctx, Item{Kind: KindDLCFile, Filename: "c.dlc", Data: []byte{1, 2}}, ""); err != nil {
+	if err := j.Add(ctx, Item{Kind: KindDLCFile, Filename: "c.dlc", Data: []byte{1, 2}, Review: true}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(added) != 1 || added[0] != "https://h.example/f?a=1&b=2" {
-		t.Fatalf("added %q", added)
+	if len(f.added) != 1 || f.added[0]["links"] != "https://h.example/f?a=1&b=2" || f.added[0]["autostart"] != false {
+		t.Fatalf("added %v", f.added)
 	}
 	dl, err := j.Downloads(ctx)
-	if err != nil || len(dl) != 4 {
+	if err != nil || len(dl) != 3 {
 		t.Fatalf("downloads %+v %v", dl, err)
 	}
-	if dl[0].State != "downloading" || dl[0].Progress != 0.25 || dl[1].State != "paused" || dl[2].State != "crawling" || dl[3].State != "done" {
+	if dl[0].State != "downloading" || dl[0].Progress != 0.25 || dl[1].State != "paused" || dl[2].State != "done" {
 		t.Fatalf("states %+v", dl)
+	}
+
+	pkgs, crawling, err := j.Review(ctx)
+	if err != nil || crawling || len(pkgs) != 2 {
+		t.Fatalf("review %+v %v %v", pkgs, crawling, err)
+	}
+	sel := func(p ReviewPackage) string {
+		var s []string
+		for _, l := range p.Links {
+			if l.Selected {
+				s = append(s, l.Name)
+			}
+		}
+		return strings.Join(s, ",")
+	}
+	// An album: its images. A page with a video: only the video (not the
+	// thumbnail, the page, or the offline file).
+	if sel(pkgs[0]) != "a.jpg,b.png" || sel(pkgs[1]) != "movie.mp4" || len(pkgs[1].Links) != 4 || pkgs[0].Auto {
+		t.Fatalf("selection %q %q", sel(pkgs[0]), sel(pkgs[1]))
+	}
+}
+
+func TestJDownloaderAutoStart(t *testing.T) {
+	f := &fakeJD{t: t, crawling: 2}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	j := NewJDownloader(srv.URL)
+	j.pollEvery = 10 * time.Millisecond
+	j.autoJobs[77] = true
+	j.autoStart(77) // what Add starts in the background for Review: false
+	if fmt.Sprint(f.moved) != "[11 12 21]" || fmt.Sprint(f.removed) != "[22 23 24]" {
+		t.Fatalf("moved %v removed %v", f.moved, f.removed)
+	}
+	if len(j.autoJobs) != 0 {
+		t.Fatal("job still tracked")
+	}
+}
+
+func TestPickRelevant(t *testing.T) {
+	links := func(names ...string) []ReviewLink {
+		var l []ReviewLink
+		for _, n := range names {
+			l = append(l, ReviewLink{Name: n, Availability: "ONLINE"})
+		}
+		return l
+	}
+	for names, want := range map[string]string{
+		"a.jpg b.webp":                  "true true",
+		"v.mkv t.jpg i.html":            "true false false",
+		"part1.rar part2.rar cover.png": "true true false",
+		"file_without_ext x.jpg":        "true false",
+		"index.html":                    "false",
+	} {
+		got := fmt.Sprint(pickRelevant(links(strings.Fields(names)...)))
+		if got != "["+want+"]" {
+			t.Errorf("%s: %s, want [%s]", names, got, want)
+		}
 	}
 }
 
@@ -323,5 +425,41 @@ func TestSABnzbdErrorHidesKey(t *testing.T) {
 	err := NewSABnzbd("http://127.0.0.1:1", "secretkey").Add(context.Background(), Item{Kind: KindNZBURL, URL: "https://x/y.nzb"}, "")
 	if err == nil || strings.Contains(err.Error(), "secretkey") {
 		t.Fatalf("error leaks the key: %v", err)
+	}
+}
+
+func TestReviewEndpoints(t *testing.T) {
+	f := &fakeJD{t: t}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	s := &server{clients: map[Target]Client{TargetJDownloader: NewJDownloader(srv.URL)}}
+	h := s.routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/review", nil))
+	if !strings.Contains(rec.Body.String(), `"name":"movie.mp4"`) || !strings.Contains(rec.Body.String(), `"id":"20"`) {
+		t.Fatalf("review %s", rec.Body)
+	}
+
+	post := func(path, body string, xdrop bool) int {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if xdrop {
+			req.Header.Set("X-Drop", "1")
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := post("/api/review/start", `{"start":["21"],"remove":["22"]}`, false); c != http.StatusForbidden {
+		t.Fatalf("without X-Drop: %d", c)
+	}
+	if c := post("/api/review/start", `{"start":["21"],"remove":["22","23"]}`, true); c != 200 || fmt.Sprint(f.moved) != "[21]" || fmt.Sprint(f.removed) != "[22 23]" {
+		t.Fatalf("start %d %v %v", c, f.moved, f.removed)
+	}
+	if c := post("/api/review/discard", `{"packages":["10"]}`, true); c != 200 || fmt.Sprint(f.removedP) != "[10]" {
+		t.Fatalf("discard %d %v", c, f.removedP)
+	}
+	if c := post("/api/review/start", `{"start":["x"]}`, true); c != http.StatusBadRequest {
+		t.Fatalf("bad id: %d", c)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/drop", s.handleDrop)
+	mux.HandleFunc("GET /api/review", s.handleReview)
+	mux.HandleFunc("POST /api/review/start", s.handleReviewStart)
+	mux.HandleFunc("POST /api/review/discard", s.handleReviewDiscard)
 	mux.HandleFunc("GET /", s.handleStatic)
 	return mux
 }
@@ -154,7 +158,9 @@ type Result struct {
 }
 
 // handleDrop takes a multipart form: text (links anywhere in it), files,
-// target ("auto" or a client) and category (for Deluge/SABnzbd).
+// target ("auto" or a client), category (for Deluge/SABnzbd) and review
+// ("0" lets drop start JDownloader's relevant files itself; anything else
+// leaves them in the link grabber for the review list).
 //
 // It only answers requests carrying the X-Drop header: a cross-site form
 // can't set it, so another page can't make a logged-in browser add
@@ -171,6 +177,7 @@ func (s *server) handleDrop(w http.ResponseWriter, r *http.Request) {
 	}
 	target := Target(r.FormValue("target"))
 	category := r.FormValue("category")
+	review := r.FormValue("review") != "0"
 
 	var items []Item
 	var results []Result
@@ -204,6 +211,7 @@ func (s *server) handleDrop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, it := range items {
+		it.Review = review
 		results = append(results, s.add(r.Context(), it, target, category))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
@@ -237,6 +245,113 @@ func (s *server) add(ctx context.Context, it Item, target Target, category strin
 	}
 	log.Printf("drop %s -> %s: ok=%v %s", it.Kind, t, res.OK, res.Error)
 	return res
+}
+
+// Reviewer is a client with a review list (JDownloader's link grabber).
+type Reviewer interface {
+	Review(ctx context.Context) ([]ReviewPackage, bool, error)
+	Start(ctx context.Context, start, remove []int64) error
+	Discard(ctx context.Context, packages []int64) error
+}
+
+func (s *server) reviewer() Reviewer {
+	r, _ := s.clients[TargetJDownloader].(Reviewer)
+	return r
+}
+
+// handleReview lists the packages waiting in JDownloader's link grabber.
+func (s *server) handleReview(w http.ResponseWriter, r *http.Request) {
+	rv := s.reviewer()
+	if rv == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"packages": []ReviewPackage{}})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), statusTimeout)
+	defer cancel()
+	pkgs, crawling, err := rv.Review(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"packages": []ReviewPackage{}, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"packages": pkgs, "crawling": crawling})
+}
+
+// reviewAction decodes a review request body after the same X-Drop check as
+// /api/drop.
+func (s *server) reviewAction(w http.ResponseWriter, r *http.Request, body any) (Reviewer, bool) {
+	if r.Header.Get("X-Drop") == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing X-Drop header"})
+		return nil, false
+	}
+	rv := s.reviewer()
+	if rv == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "jdownloader is not configured"})
+		return nil, false
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
+		return nil, false
+	}
+	return rv, true
+}
+
+// ids parses JDownloader ids (sent as strings: they don't fit a JS number
+// safely in every case).
+func ids(in []string) ([]int64, error) {
+	out := make([]int64, 0, len(in))
+	for _, s := range in {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// handleReviewStart downloads the chosen links and drops the rest.
+func (s *server) handleReviewStart(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Start  []string `json:"start"`
+		Remove []string `json:"remove"`
+	}
+	rv, ok := s.reviewAction(w, r, &body)
+	if !ok {
+		return
+	}
+	start, err1 := ids(body.Start)
+	remove, err2 := ids(body.Remove)
+	if err := errors.Join(err1, err2); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := rv.Start(r.Context(), start, remove); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	log.Printf("review: started %d links, removed %d", len(start), len(remove))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleReviewDiscard removes whole packages from the link grabber.
+func (s *server) handleReviewDiscard(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Packages []string `json:"packages"`
+	}
+	rv, ok := s.reviewAction(w, r, &body)
+	if !ok {
+		return
+	}
+	pkgs, err := ids(body.Packages)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := rv.Discard(r.Context(), pkgs); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handleStatic serves the built frontend; unknown paths get index.html (the

@@ -36,6 +36,9 @@ type Item struct {
 	URL      string // links
 	Filename string // files
 	Data     []byte // files
+	// Review: JDownloader items wait in the link grabber for the owner to
+	// pick files in drop, instead of drop starting the relevant ones itself.
+	Review bool
 }
 
 // Label is how the item shows up in results: the link or the file name.

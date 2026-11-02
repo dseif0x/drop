@@ -41,8 +41,17 @@ Localhost Only` to false (port: `RemoteAPI: Deprecated Api Port`, default
 3128), then restart JDownloader. The API has no authentication: only let
 drop reach that port.
 
-Links are added with autostart and go to JDownloader's default download
-folder.
+Links go to JDownloader's link grabber, not straight to the download list:
+for a page without a JDownloader plugin, its generic parser finds every
+image and thumbnail on it. With **review** on (the default, a checkbox next
+to Send), drop lists the link grabber's packages with their files and a
+suggested selection; you start the chosen files (the rest is removed) or
+discard the package. With review off, drop applies the suggestion itself
+once JDownloader has checked the links. The suggestion: never offline files;
+if a package has videos, archives, audio, documents or other non-image
+files, only those (no thumbnails, HTML pages, .nfo/.txt); if it is only
+images (an album), the images. Downloads go to JDownloader's default
+download folder.
 
 ## Development
 

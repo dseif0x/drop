@@ -12,6 +12,28 @@
   let dropError = $state('');
   let dragging = $state(false);
 
+  // Review JDownloader links before downloading (remembered per browser).
+  let review = $state(
+    (() => {
+      try {
+        return localStorage.getItem('drop.review') !== '0';
+      } catch {
+        return true;
+      }
+    })()
+  );
+  $effect(() => {
+    try {
+      localStorage.setItem('drop.review', review ? '1' : '0');
+    } catch {}
+  });
+  let reviewPkgs = $state([]);
+  let crawling = $state(false);
+  let reviewError = $state('');
+  // Per link id: the owner's choice, overriding the suggestion.
+  let choice = $state({});
+  let busyPkg = $state('');
+
   let downloads = $state([]);
   let statusErrors = $state({});
   let filter = $state('active');
@@ -48,6 +70,61 @@
     }
   }
 
+  async function loadReview() {
+    try {
+      const r = await fetch('/api/review');
+      const out = await r.json();
+      reviewPkgs = out.packages;
+      crawling = !!out.crawling;
+      reviewError = out.error ?? '';
+    } catch {
+      reviewError = 'not reachable';
+    }
+  }
+
+  function selected(link) {
+    return choice[link.id] ?? link.selected;
+  }
+
+  function setAll(pkg, on) {
+    for (const l of pkg.links) if (l.availability !== 'OFFLINE') choice[l.id] = on;
+  }
+
+  async function reviewPost(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'X-Drop': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error((await r.json()).error ?? `HTTP ${r.status}`);
+  }
+
+  async function startPkg(pkg) {
+    busyPkg = pkg.id;
+    try {
+      const start = pkg.links.filter(selected).map((l) => l.id);
+      const remove = pkg.links.filter((l) => !selected(l)).map((l) => l.id);
+      await reviewPost('/api/review/start', { start, remove });
+      await Promise.all([loadReview(), loadStatus()]);
+    } catch (e) {
+      reviewError = String(e.message ?? e);
+    } finally {
+      busyPkg = '';
+    }
+  }
+
+  async function discardPkg(pkg) {
+    busyPkg = pkg.id;
+    try {
+      await reviewPost('/api/review/discard', { packages: [pkg.id] });
+      await loadReview();
+    } catch (e) {
+      reviewError = String(e.message ?? e);
+    } finally {
+      busyPkg = '';
+    }
+  }
+
   async function loadStatus() {
     try {
       const r = await fetch('/api/status');
@@ -74,6 +151,7 @@
     form.set('text', text);
     form.set('target', target);
     form.set('category', category);
+    form.set('review', review ? '1' : '0');
     for (const f of files) form.append('files', f);
     try {
       const r = await fetch('/api/drop', { method: 'POST', body: form, headers: { 'X-Drop': '1' } });
@@ -87,6 +165,7 @@
         text = failed.filter((x) => !files.some((f) => f.name === x.item)).map((x) => x.item).join('\n');
         files = files.filter((f) => failed.some((x) => x.item === f.name));
         loadStatus();
+        loadReview();
       }
     } catch (e) {
       dropError = String(e);
@@ -119,7 +198,12 @@
 
     loadConfig();
     loadStatus();
-    let timer = setInterval(() => document.visibilityState === 'visible' && loadStatus(), 2000);
+    loadReview();
+    let timer = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      loadStatus();
+      loadReview();
+    }, 2000);
 
     let depth = 0;
     const enter = (e) => {
@@ -204,6 +288,11 @@
         </select>
       {/if}
 
+      {#if clients.some((c) => c.target === 'jdownloader')}
+        <label class="toggle" title="JDownloader links wait below until you pick the files">
+          <input type="checkbox" bind:checked={review} /> Review JDownloader links
+        </label>
+      {/if}
       <div class="spacer"></div>
       <input bind:this={fileInput} type="file" multiple accept=".torrent,.nzb,.dlc" hidden
         onchange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
@@ -211,7 +300,10 @@
       <button class="primary" disabled={!canSend} onclick={send}>{sending ? 'Sending…' : 'Send'}</button>
     </div>
     {#if target === 'auto'}
-      <p class="muted small">Auto: magnets and .torrent → Deluge, .nzb → SABnzbd, all other links → JDownloader.</p>
+      <p class="muted small">
+        Auto: magnets and .torrent → Deluge, .nzb → SABnzbd, all other links → JDownloader.
+        {#if !review}JDownloader starts only the relevant files (videos, archives, …; images only for pure albums).{/if}
+      </p>
     {/if}
 
     {#if dropError}<p class="error">{dropError}</p>{/if}
@@ -228,6 +320,53 @@
       </ul>
     {/if}
   </section>
+
+  {#if reviewPkgs.length || crawling || reviewError}
+    <section class="card">
+      <div class="status-head">
+        <h2>Review <span class="muted small">JDownloader link grabber</span></h2>
+        {#if crawling}<span class="muted small">JDownloader is still collecting links…</span>{/if}
+      </div>
+      {#if reviewError}<p class="error small">JDownloader: {reviewError}</p>{/if}
+      {#each reviewPkgs as pkg (pkg.id)}
+        <div class="pkg">
+          <div class="pkg-head">
+            <strong class="name" title={pkg.name}>{pkg.name}</strong>
+            <span class="muted small">
+              {pkg.links.filter(selected).length}/{pkg.links.length} ·
+              {formatBytes(pkg.links.filter(selected).reduce((n, l) => n + (l.size || 0), 0))}
+            </span>
+          </div>
+          {#if pkg.auto}
+            <p class="muted small">Starts automatically once JDownloader has checked the links.</p>
+          {:else}
+            <ul class="links">
+              {#each pkg.links as l (l.id)}
+                <li class:offline={l.availability === 'OFFLINE'}>
+                  <label>
+                    <input type="checkbox" checked={selected(l)} disabled={l.availability === 'OFFLINE'}
+                      onchange={(e) => (choice[l.id] = e.target.checked)} />
+                    <span class="name" title={l.url || l.name}>{l.name}</span>
+                  </label>
+                  <span class="muted small">{l.size ? formatBytes(l.size) : ''}</span>
+                  {#if l.availability !== 'ONLINE'}<span class="muted small">{l.availability.toLowerCase().replace('_', ' ')}</span>{/if}
+                </li>
+              {/each}
+            </ul>
+            <div class="controls">
+              <button class="ghost small" onclick={() => setAll(pkg, true)}>All</button>
+              <button class="ghost small" onclick={() => setAll(pkg, false)}>None</button>
+              <div class="spacer"></div>
+              <button class="ghost" disabled={busyPkg === pkg.id} onclick={() => discardPkg(pkg)}>Discard</button>
+              <button class="primary" disabled={busyPkg === pkg.id || !pkg.links.some(selected)} onclick={() => startPkg(pkg)}>
+                Download {pkg.links.filter(selected).length}
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </section>
+  {/if}
 
   <section class="card">
     <div class="status-head">
